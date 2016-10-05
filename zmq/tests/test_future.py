@@ -2,6 +2,9 @@
 # Copyright (c) PyZMQ Developers
 # Distributed under the terms of the Modified BSD License.
 
+from datetime import timedelta
+import os
+
 import pytest
 gen = pytest.importorskip('tornado.gen')
 
@@ -97,6 +100,24 @@ class TestFutureSocket(BaseZMQTestCase):
             with pytest.raises(zmq.Again):
                 yield s.send(b'not going anywhere')
         self.loop.run_sync(test)
+    
+    @pytest.mark.now
+    def test_send_noblock(self):
+        @gen.coroutine
+        def test():
+            s = self.socket(zmq.PUSH)
+            with pytest.raises(zmq.Again):
+                yield s.send(b'not going anywhere', flags=zmq.NOBLOCK)
+        self.loop.run_sync(test)
+
+    @pytest.mark.now
+    def test_send_multipart_noblock(self):
+        @gen.coroutine
+        def test():
+            s = self.socket(zmq.PUSH)
+            with pytest.raises(zmq.Again):
+                yield s.send_multipart([b'not going anywhere'], flags=zmq.NOBLOCK)
+        self.loop.run_sync(test)
 
     def test_recv_string(self):
         @gen.coroutine
@@ -126,6 +147,29 @@ class TestFutureSocket(BaseZMQTestCase):
             self.assertEqual(recvd, obj)
         self.loop.run_sync(test)
 
+    def test_recv_json_cancelled(self):
+        @gen.coroutine
+        def test():
+            a, b = self.create_bound_pair(zmq.PUSH, zmq.PULL)
+            f = b.recv_json()
+            assert not f.done()
+            f.cancel()
+            # cycle eventloop to allow cancel events to fire
+            yield gen.sleep(0)
+            obj = dict(a=5)
+            yield a.send_json(obj)
+            with pytest.raises(future.CancelledError):
+                recvd = yield f
+            assert f.done()
+            # give it a chance to incorrectly consume the event
+            events = yield b.poll(timeout=5)
+            assert events
+            yield gen.sleep(0)
+            # make sure cancelled recv didn't eat up event
+            recvd = yield gen.with_timeout(timedelta(seconds=5), b.recv_json())
+            assert recvd == obj
+        self.loop.run_sync(test)
+
     def test_recv_pyobj(self):
         @gen.coroutine
         def test():
@@ -146,12 +190,12 @@ class TestFutureSocket(BaseZMQTestCase):
             a, b = self.create_bound_pair(zmq.PUSH, zmq.PULL)
             f = b.poll(timeout=0)
             self.assertEqual(f.result(), 0)
-        
+
             f = b.poll(timeout=1)
             assert not f.done()
             evt = yield f
             self.assertEqual(evt, 0)
-        
+
             f = b.poll(timeout=1000)
             assert not f.done()
             yield a.send_multipart([b'hi', b'there'])
@@ -159,4 +203,35 @@ class TestFutureSocket(BaseZMQTestCase):
             self.assertEqual(evt, zmq.POLLIN)
             recvd = yield b.recv_multipart()
             self.assertEqual(recvd, [b'hi', b'there'])
+        self.loop.run_sync(test)
+
+    def test_poll_raw(self):
+        @gen.coroutine
+        def test():
+            p = future.Poller()
+            # make a pipe
+            r, w = os.pipe()
+            r = os.fdopen(r, 'rb')
+            w = os.fdopen(w, 'wb')
+
+            # POLLOUT
+            p.register(r, zmq.POLLIN)
+            p.register(w, zmq.POLLOUT)
+            evts = yield p.poll(timeout=1)
+            evts = dict(evts)
+            assert r.fileno() not in evts
+            assert w.fileno() in evts
+            assert evts[w.fileno()] == zmq.POLLOUT
+
+            # POLLIN
+            p.unregister(w)
+            w.write(b'x')
+            w.flush()
+            evts = yield p.poll(timeout=1000)
+            evts = dict(evts)
+            assert r.fileno() in evts
+            assert evts[r.fileno()] == zmq.POLLIN
+            assert r.read(1) == b'x'
+            r.close()
+            w.close()
         self.loop.run_sync(test)

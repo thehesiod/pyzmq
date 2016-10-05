@@ -4,6 +4,7 @@
 # Distributed under the terms of the Modified BSD License.
 
 from collections import namedtuple
+from itertools import chain
 from zmq import POLLOUT, POLLIN
 
 try:
@@ -43,6 +44,7 @@ class _AsyncTornado(object):
 
 class _AsyncPoller(_zmq.Poller):
     """Poller that returns a Future on poll, instead of blocking."""
+
     def poll(self, timeout=-1):
         """Return a Future for a poll event"""
         future = self._Future()
@@ -58,13 +60,30 @@ class _AsyncPoller(_zmq.Poller):
         loop = self._default_loop()
         
         # register Future to be called as soon as any event is available on any socket
-        # only support polling on zmq sockets, for now
         watcher = self._Future()
+        
+        # watch raw sockets:
+        raw_sockets = []
+        def wake_raw(*args):
+            if not watcher.done():
+                watcher.set_result(None)
+
+        watcher.add_done_callback(lambda f: self._unwatch_raw_sockets(loop, *raw_sockets))
+
         for socket, mask in self.sockets:
-            if mask & _zmq.POLLIN:
-                socket._add_recv_event('poll', future=watcher)
-            if mask & _zmq.POLLOUT:
-                socket._add_send_event('poll', future=watcher)
+            if isinstance(socket, _AsyncSocket):
+                if mask & _zmq.POLLIN:
+                    socket._add_recv_event('poll', future=watcher)
+                if mask & _zmq.POLLOUT:
+                    socket._add_send_event('poll', future=watcher)
+            else:
+                raw_sockets.append(socket)
+                evt = 0
+                if mask & _zmq.POLLIN:
+                    evt |= self._READ
+                if mask & _zmq.POLLOUT:
+                    evt |= self._WRITE
+                self._watch_raw_socket(loop, socket, evt, wake_raw)
         
         def on_poll_ready(f):
             if future.done():
@@ -96,16 +115,24 @@ class _AsyncPoller(_zmq.Poller):
                 else:
                     loop.remove_timeout(timeout_handle)
             future.add_done_callback(cancel_timeout)
-        
+
         def cancel_watcher(f):
             if not watcher.done():
                 watcher.cancel()
         future.add_done_callback(cancel_watcher)
-            
+
         return future
 
 class Poller(_AsyncTornado, _AsyncPoller):
-    pass
+    def _watch_raw_socket(self, loop, socket, evt, f):
+        """Schedule callback for a raw socket"""
+        loop.add_handler(socket, lambda *args: f(), evt)
+
+    def _unwatch_raw_sockets(self, loop, *sockets):
+        """Unschedule callback for a raw socket"""
+        for socket in sockets:
+            loop.remove_handler(socket)
+
 
 class _AsyncSocket(_zmq.Socket):
     
@@ -115,7 +142,7 @@ class _AsyncSocket(_zmq.Socket):
     _shadow_sock = None
     _poller_class = Poller
     io_loop = None
-    
+
     def __init__(self, context, socket_type, io_loop=None):
         super(_AsyncSocket, self).__init__(context, socket_type)
         self.io_loop = io_loop or self._default_loop()
@@ -124,7 +151,16 @@ class _AsyncSocket(_zmq.Socket):
         self._state = 0
         self._shadow_sock = _zmq.Socket.shadow(self.underlying)
         self._init_io_state()
-    
+
+    def close(self, linger=None):
+        if not self.closed:
+            for event in chain(self._recv_futures, self._send_futures):
+                if not event.future.done():
+                    event.future.cancel()
+            self._clear_io_state()
+        super(_AsyncSocket, self).close(linger=linger)
+    close.__doc__ = _zmq.Socket.close.__doc__
+
     def recv_multipart(self, flags=0, copy=True, track=False):
         """Receive a complete multipart zmq message.
         
@@ -169,6 +205,9 @@ class _AsyncSocket(_zmq.Socket):
         """Deserialize with Futures"""
         f = self._Future()
         def _chain(_):
+            """Chain result through serialization to recvd"""
+            if f.done():
+                return
             if recvd.exception():
                 f.set_exception(recvd.exception())
             else:
@@ -180,6 +219,15 @@ class _AsyncSocket(_zmq.Socket):
                 else:
                     f.set_result(loaded)
         recvd.add_done_callback(_chain)
+
+        def _chain_cancel(_):
+            """Chain cancellation from f to recvd"""
+            if recvd.done():
+                return
+            if f.cancelled():
+                recvd.cancel()
+        f.add_done_callback(_chain_cancel)
+
         return f
 
     def poll(self, timeout=None, flags=_zmq.POLLIN):
@@ -214,6 +262,19 @@ class _AsyncSocket(_zmq.Socket):
             if future.done():
                 # future already resolved, do nothing
                 return
+
+            # pop the entry from _recv_futures
+            for f_idx, (f, kind, kwargs, _) in enumerate(self._recv_futures):
+                if f == future:
+                    self._recv_futures.pop(f_idx)
+                    break
+
+            # pop the entry from _send_futures
+            for f_idx, (f, kind, kwargs, _) in enumerate(self._send_futures):
+                if f == future:
+                    self._send_futures.pop(f_idx)
+                    break
+
             # raise EAGAIN
             future.set_exception(_zmq.Again())
         self._call_later(timeout, future_timeout)
@@ -242,14 +303,17 @@ class _AsyncSocket(_zmq.Socket):
                 f.set_result(r)
             return f
 
+        # we add it to the list of futures before we add the timeout as the
+        # timeout will remove the future from recv_futures to avoid leaks
+        self._recv_futures.append(
+            _FutureEvent(f, kind, kwargs, msg=None)
+        )
+
         if hasattr(_zmq, 'RCVTIMEO'):
             timeout_ms = self._shadow_sock.rcvtimeo
             if timeout_ms >= 0:
                 self._add_timeout(f, timeout_ms * 1e-3)
 
-        self._recv_futures.append(
-            _FutureEvent(f, kind, kwargs, msg=None)
-        )
         if self.events & POLLIN:
             # recv immediately, if we can
             self._handle_recv()
@@ -261,26 +325,27 @@ class _AsyncSocket(_zmq.Socket):
         """Add a send event, returning the corresponding Future"""
         f = future or self._Future()
         if kind.startswith('send') and kwargs.get('flags', 0) & _zmq.DONTWAIT:
-            if kind == 'send_multipart':
-                kwargs['msg_parts'] = msg
             # short-circuit non-blocking calls
             send = getattr(self._shadow_sock, kind)
             try:
-                r = send(**kwargs)
+                r = send(msg, **kwargs)
             except Exception as e:
                 f.set_exception(e)
             else:
                 f.set_result(r)
             return f
 
+        # we add it to the list of futures before we add the timeout as the
+        # timeout will remove the future from recv_futures to avoid leaks
+        self._send_futures.append(
+            _FutureEvent(f, kind, kwargs=kwargs, msg=msg)
+        )
+
         if hasattr(_zmq, 'SNDTIMEO'):
             timeout_ms = self._shadow_sock.sndtimeo
             if timeout_ms >= 0:
                 self._add_timeout(f, timeout_ms * 1e-3)
 
-        self._send_futures.append(
-            _FutureEvent(f, kind, kwargs=kwargs, msg=msg)
-        )
         if self.events & POLLOUT:
             # send immediately if we can
             self._handle_send()
@@ -383,10 +448,18 @@ class _AsyncSocket(_zmq.Socket):
         """Update IOLoop handler with state."""
         self._state = state
         self.io_loop.update_handler(self, state)
-    
+
     def _init_io_state(self):
         """initialize the ioloop event handler"""
         self.io_loop.add_handler(self, self._handle_events, self._state)
+
+    def _clear_io_state(self):
+        """unregister the ioloop event handler
+        
+        called once during close
+        """
+        self.io_loop.remove_handler(self)
+
 
 class Socket(_AsyncTornado, _AsyncSocket):
     pass

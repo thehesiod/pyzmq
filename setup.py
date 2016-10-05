@@ -488,25 +488,36 @@ class Configure(build_ext):
         fetch_libzmq(bundledir)
         
         stage_platform_hpp(pjoin(bundledir, 'zeromq'))
-        
-        tweetnacl = pjoin(bundledir, 'zeromq', 'tweetnacl')
-        tweetnacl_sources = glob(pjoin(tweetnacl, 'src', '*.c'))
-        randombytes = pjoin(tweetnacl, 'contrib', 'randombytes')
-        if sys.platform.startswith('win'):
-            tweetnacl_sources.append(pjoin(randombytes, 'winrandom.c'))
+
+        sources = [pjoin('buildutils', 'initlibzmq.c')]
+        sources += glob(pjoin(bundledir, 'zeromq', 'src', '*.cpp'))
+
+        includes = [
+            pjoin(bundledir, 'zeromq', 'include')
+        ]
+
+        if bundled_version < (4, 2, 0):
+            tweetnacl = pjoin(bundledir, 'zeromq', 'tweetnacl')
+            tweetnacl_sources = glob(pjoin(tweetnacl, 'src', '*.c'))
+
+            randombytes = pjoin(tweetnacl, 'contrib', 'randombytes')
+            if sys.platform.startswith('win'):
+                tweetnacl_sources.append(pjoin(randombytes, 'winrandom.c'))
+            else:
+                tweetnacl_sources.append(pjoin(randombytes, 'devurandom.c'))
+
+            sources += tweetnacl_sources
+            includes.append(pjoin(tweetnacl, 'src'))
+            includes.append(randombytes)
         else:
-            tweetnacl_sources.append(pjoin(randombytes, 'devurandom.c'))
+            # >= 4.2
+            sources += glob(pjoin(bundledir, 'zeromq', 'src', 'tweetnacl.c'))
+
         # construct the Extensions:
         libzmq = Extension(
             'zmq.libzmq',
-            sources = [pjoin('buildutils', 'initlibzmq.c')] + \
-                      glob(pjoin(bundledir, 'zeromq', 'src', '*.cpp')) + \
-                      tweetnacl_sources,
-            include_dirs = [
-                pjoin(bundledir, 'zeromq', 'include'),
-                pjoin(tweetnacl, 'src'),
-                randombytes,
-            ],
+            sources=sources,
+            include_dirs=includes,
         )
         
         # register the extension:
@@ -529,7 +540,7 @@ class Configure(build_ext):
         
         if sys.platform.startswith('win'):
             # include defines from zeromq msvc project:
-            libzmq.define_macros.append(('FD_SETSIZE', 1024))
+            libzmq.define_macros.append(('FD_SETSIZE', 16384))
             libzmq.define_macros.append(('DLL_EXPORT', 1))
             libzmq.define_macros.append(('_CRT_SECURE_NO_WARNINGS', 1))
             
@@ -586,6 +597,17 @@ class Configure(build_ext):
                     # seem to need explicit libstdc++ on linux + pypy
                     # not sure why
                     libzmq.libraries.append("stdc++")
+        
+        # copy the header files to the source tree.
+        bundledincludedir = pjoin('zmq', 'include')
+        if not os.path.exists(bundledincludedir):
+            os.makedirs(bundledincludedir)
+        if not os.path.exists(pjoin(self.build_lib, bundledincludedir)):
+            os.makedirs(pjoin(self.build_lib, bundledincludedir))
+        
+        for header in glob(pjoin(bundledir, 'zeromq', 'include', '*.h')):
+            shutil.copyfile(header, pjoin(bundledincludedir, basename(header)))
+            shutil.copyfile(header, pjoin(self.build_lib, bundledincludedir, basename(header)))
         
         # update other extensions, with bundled settings
         self.config['libzmq_extension'] = True
@@ -888,6 +910,9 @@ class CleanCommand(Command):
         bundled = glob(pjoin('zmq', 'libzmq*'))
         _clean_me.extend([ b for b in bundled if b not in _clean_me ])
         
+        bundled_headers = glob(pjoin('zmq', 'include', '*.h'))
+        _clean_me.extend([ h for h in bundled_headers if h not in _clean_me])
+        
         for clean_me in _clean_me:
             print("removing %s" % clean_me)
             try:
@@ -932,9 +957,9 @@ class CheckingBuildExt(build_ext):
           for src in ext.sources:
             if not os.path.exists(src):
                 fatal("""Cython-generated file '%s' not found.
-                Cython >= 0.16 is required to compile pyzmq from a development branch.
+                Cython >= %s is required to compile pyzmq from a development branch.
                 Please install Cython or download a release package of pyzmq.
-                """%src)
+                """ % (src, min_cython_version))
     
     def build_extensions(self):
         self.check_cython_extensions(self.extensions)
@@ -996,7 +1021,6 @@ buffers = pxd('utils', 'buffers')
 message = pxd('backend', 'cython', 'message')
 context = pxd('backend', 'cython', 'context')
 socket = pxd('backend', 'cython', 'socket')
-utils = pxd('backend', 'cython', 'utils')
 checkrc = pxd('backend', 'cython', 'checkrc')
 monqueue = pxd('devices', 'monitoredqueue')
 
@@ -1004,7 +1028,7 @@ submodules = {
     'backend.cython' : {'constants': [libzmq, pxi('backend', 'cython', 'constants')],
             'error':[libzmq, checkrc],
             '_poll':[libzmq, socket, context, checkrc],
-            'utils':[libzmq, utils, checkrc],
+            'utils':[libzmq, checkrc],
             'context':[context, libzmq, checkrc],
             'message':[libzmq, buffers, message, checkrc],
             'socket':[context, message, socket, libzmq, buffers, checkrc],
@@ -1016,14 +1040,17 @@ submodules = {
     },
 }
 
+min_cython_version = '0.20'
 try:
     import Cython
-    if V(Cython.__version__) < V('0.16'):
-        raise ImportError("Cython >= 0.16 required, found %s" % Cython.__version__)
+    if V(Cython.__version__) < V(min_cython_version):
+        raise ImportError("Cython >= %s required for cython build, found %s" % (
+            min_cython_version, Cython.__version__))
     from Cython.Distutils import build_ext as build_ext_c
-    cython=True
+    from Cython.Distutils import Extension
+    cython = True
 except Exception:
-    cython=False
+    cython = False
     suffix = '.c'
     cmdclass['build_ext'] = CheckingBuildExt
     
@@ -1044,12 +1071,13 @@ except Exception:
                 warn("Cython is missing")
             else:
                 cv = getattr(Cython, "__version__", None)
-                if cv is None or V(cv) < V('0.16'):
+                if cv is None or V(cv) < V(min_cython_version):
                     warn(
-                        "Cython >= 0.16 is required for compiling Cython sources, "
-                        "found: %s" % (cv or "super old")
+                        "Cython >= %s is required for compiling Cython sources, "
+                        "found: %s" % (min_cython_version, cv or Cython)
                     )
     cmdclass['cython'] = MissingCython
+    
 else:
     
     suffix = '.pyx'
@@ -1063,13 +1091,8 @@ else:
         
         def build_extension(self, ext):
             pass
-    
+
     class zbuild_ext(build_ext_c):
-        
-        def finalize_options(self):
-            build_ext_c.finalize_options(self)
-            # set binding so that compiled methods can be inspected
-            self.cython_directives['binding'] = True
         
         def build_extensions(self):
             if self.compiler.compiler_type == 'mingw32':
@@ -1090,26 +1113,29 @@ else:
     cmdclass['build_ext'] =  zbuild_ext
 
 extensions = []
+ext_include_dirs = [pjoin('zmq', sub) for sub in ('utils',)]
+ext_kwargs = {
+    'include_dirs': ext_include_dirs,
+}
+if cython:
+    # set binding so that compiled methods can be inspected
+    ext_kwargs['cython_directives'] = {'binding': True}
+
 for submod, packages in submodules.items():
     for pkg in sorted(packages):
         sources = [pjoin('zmq', submod.replace('.', os.path.sep), pkg+suffix)]
-        if suffix == '.pyx':
-            sources.extend(packages[pkg])
         ext = Extension(
             'zmq.%s.%s'%(submod, pkg),
             sources = sources,
-            include_dirs=[pjoin('zmq', sub) for sub in ('utils',pjoin('backend', 'cython'),'devices')],
+            **ext_kwargs
         )
-        if suffix == '.pyx' and ext.sources[0].endswith('.c'):
-            # undo setuptools stupidly clobbering cython sources:
-            ext.sources = sources
         extensions.append(ext)
 
 if pypy:
     # add dummy extension, to ensure build_ext runs
     dummy_ext = Extension('dummy', sources=[])
     extensions = [dummy_ext]
-    
+
     bld_ext = cmdclass['build_ext']
     class pypy_build_ext(bld_ext):
         """hack to build pypy extension only after building bundled libzmq
@@ -1217,10 +1243,8 @@ setup_args = dict(
         'Operating System :: POSIX',
         'Topic :: System :: Networking',
         'Programming Language :: Python :: 2',
-        'Programming Language :: Python :: 2.6',
         'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.2',
         'Programming Language :: Python :: 3.3',
         'Programming Language :: Python :: 3.4',
         'Programming Language :: Python :: 3.5',
