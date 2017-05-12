@@ -27,7 +27,7 @@ class _TornadoFuture(Future):
         return self.done() and isinstance(self.exception(), CancelledError)
 
 import zmq as _zmq
-from zmq.eventloop.ioloop import IOLoop
+from zmq.eventloop.ioloop import IOLoop, ZMQIOLoop
 
 
 _FutureEvent = namedtuple('_FutureEvent', ('future', 'kind', 'kwargs', 'msg'))
@@ -39,7 +39,12 @@ class _AsyncTornado(object):
     _READ = IOLoop.READ
     _WRITE = IOLoop.WRITE
     def _default_loop(self):
-        return IOLoop.current()
+        loop = IOLoop.current()
+        if not isinstance(loop, ZMQIOLoop):
+            raise TypeError(
+                "Current tornado IOLoop is %r, not a ZMQIOLoop."
+                "  Run `zmq.eventloop.ioloop.install() first." % loop)
+        return loop
 
 
 class _AsyncPoller(_zmq.Poller):
@@ -267,12 +272,14 @@ class _AsyncSocket(_zmq.Socket):
             for f_idx, (f, kind, kwargs, _) in enumerate(self._recv_futures):
                 if f == future:
                     self._recv_futures.pop(f_idx)
+                    f._pyzmq_popped = True
                     break
 
             # pop the entry from _send_futures
             for f_idx, (f, kind, kwargs, _) in enumerate(self._send_futures):
                 if f == future:
                     self._send_futures.pop(f_idx)
+                    f._pyzmq_popped = True
                     break
 
             # raise EAGAIN
@@ -288,6 +295,20 @@ class _AsyncSocket(_zmq.Socket):
         with the same signature.
         """
         self.io_loop.call_later(delay, callback)
+
+    @staticmethod
+    def _remove_finished_future(future, event_list):
+        """Make sure that futures are removed from the event list when they resolve
+
+        Avoids delaying cleanup until the next send/recv event,
+        which may never come.
+        """
+        if getattr(future, '_pyzmq_popped', False):
+            return
+        for f_idx, (f, kind, kwargs, _) in enumerate(event_list):
+            if f is future:
+                event_list.pop(f_idx)
+                return
 
     def _add_recv_event(self, kind, kwargs=None, future=None):
         """Add a recv event, returning the corresponding Future"""
@@ -308,6 +329,9 @@ class _AsyncSocket(_zmq.Socket):
         self._recv_futures.append(
             _FutureEvent(f, kind, kwargs, msg=None)
         )
+
+        # Don't let the Future sit in _recv_events after it's done
+        f.add_done_callback(lambda f: self._remove_finished_future(f, self._recv_futures))
 
         if hasattr(_zmq, 'RCVTIMEO'):
             timeout_ms = self._shadow_sock.rcvtimeo
@@ -340,6 +364,8 @@ class _AsyncSocket(_zmq.Socket):
         self._send_futures.append(
             _FutureEvent(f, kind, kwargs=kwargs, msg=msg)
         )
+        # Don't let the Future sit in _send_futures after it's done
+        f.add_done_callback(lambda f: self._remove_finished_future(f, self._send_futures))
 
         if hasattr(_zmq, 'SNDTIMEO'):
             timeout_ms = self._shadow_sock.sndtimeo
@@ -355,9 +381,13 @@ class _AsyncSocket(_zmq.Socket):
     
     def _handle_recv(self):
         """Handle recv events"""
+        if not self._shadow_sock.events & POLLIN:
+            # event triggered, but state may have been changed between trigger and callback
+            return
         f = None
         while self._recv_futures:
             f, kind, kwargs, _ = self._recv_futures.pop(0)
+            f._pyzmq_popped = True
             # skip any cancelled futures
             if f.done():
                 f = None
@@ -390,9 +420,13 @@ class _AsyncSocket(_zmq.Socket):
             f.set_result(result)
     
     def _handle_send(self):
+        if not self._shadow_sock.events & POLLOUT:
+            # event triggered, but state may have been changed between trigger and callback
+            return
         f = None
         while self._send_futures:
             f, kind, kwargs, msg = self._send_futures.pop(0)
+            f._pyzmq_popped = True
             # skip any cancelled futures
             if f.done():
                 f = None
@@ -447,18 +481,18 @@ class _AsyncSocket(_zmq.Socket):
     def _update_handler(self, state):
         """Update IOLoop handler with state."""
         self._state = state
-        self.io_loop.update_handler(self, state)
+        self.io_loop.update_handler(self._shadow_sock, state)
 
     def _init_io_state(self):
         """initialize the ioloop event handler"""
-        self.io_loop.add_handler(self, self._handle_events, self._state)
+        self.io_loop.add_handler(self._shadow_sock, self._handle_events, self._state)
 
     def _clear_io_state(self):
         """unregister the ioloop event handler
         
         called once during close
         """
-        self.io_loop.remove_handler(self)
+        self.io_loop.remove_handler(self._shadow_sock)
 
 
 class Socket(_AsyncTornado, _AsyncSocket):
